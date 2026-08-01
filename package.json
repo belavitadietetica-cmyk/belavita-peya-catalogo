@@ -1,10 +1,10 @@
 {
   "name": "belavita-peya-catalogo",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Sincroniza stock y precios de Belavita con el catalogo de PedidosYa",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
     "express": "^4.19.2"
