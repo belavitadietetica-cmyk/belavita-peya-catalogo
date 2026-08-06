@@ -370,7 +370,11 @@ function taparPersonales(valor, profundidad = 0) {
 }
 
 async function pedirPedidos(vendor, desde, hasta, pagina = 1, porPagina = 20) {
-  const url = `${PEYA_BASE}/chains/${PEYA_CHAIN}/vendors/${VENDORS[vendor]}`
+  // La ruta correcta lleva /orders al final. La documentación la muestra
+  // sin eso y devuelve 404 mudo; se confirmó probando las variantes con
+  // /probar-rutas, y el catálogo sirvió de control para descartar que
+  // fueran las credenciales.
+  const url = `${PEYA_BASE}/chains/${PEYA_CHAIN}/vendors/${VENDORS[vendor]}/orders`
     + `?start_time=${encodeURIComponent(desde)}&end_time=${encodeURIComponent(hasta)}`
     + `&page_size=${porPagina}&page=${pagina}`;
 
@@ -422,6 +426,9 @@ app.get('/probar-pedidos', async (req, res) => {
         http: r.status,
         ok: r.ok,
         cantidad: Array.isArray(lista) ? lista.length : null,
+        // Con page_size=20, total_pages dice cuántos pedidos hay en
+        // total en la ventana, más allá de los que trae esta página.
+        total_pages: (cuerpo && cuerpo.total_pages !== undefined) ? cuerpo.total_pages : null,
         // Lo que más importa: en qué estado vienen. Si acá aparece
         // RECEIVED, se puede ver el pedido mientras se arma.
         estados: Array.isArray(lista)
