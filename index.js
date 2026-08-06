@@ -443,6 +443,94 @@ app.get('/probar-pedidos', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// SONDA DE RUTAS  ·  SOLO LECTURA
+//
+// La ruta de pedidos que figura en la documentación devuelve 404 con el
+// cuerpo vacío. Un "no encontré esa orden" real vendría con un JSON
+// explicando; un 404 mudo suele ser una ruta que no existe.
+//
+// Como el catálogo funciona con el MISMO chain y el MISMO vendor, el
+// problema no son las credenciales. Quedan dos explicaciones y hay que
+// distinguirlas:
+//
+//   a) la ruta real es otra (la documentación está abreviada o cambió)
+//   b) el servicio de órdenes no está habilitado para esta cadena
+//
+// Esto prueba las variantes plausibles de una y devuelve el código de
+// cada una. Todas son GET: no escriben nada ni en PedidosYa ni acá.
+//
+// Cómo leer el resultado:
+//   · alguna da 200          → esa es la ruta buena, seguimos
+//   · todas 404 mudas        → la API de órdenes no está habilitada,
+//                              hay que pedírsela al Account Manager
+//   · alguna da 401 o 403    → la ruta existe pero falta permiso, que
+//                              también se pide, pero es otra conversación
+// ═══════════════════════════════════════════════════════════════
+
+// GET /probar-rutas?vendor=bv2&horas=48
+app.get('/probar-rutas', async (req, res) => {
+  if (!autorizado(req)) return res.status(401).json({ error: 'no autorizado' });
+  if (!PEYA_CHAIN) return res.status(500).json({ error: 'falta PEYA_CHAIN_ID' });
+
+  const vendor = req.query.vendor || Object.keys(VENDORS).find(v => VENDORS[v]);
+  const vid = VENDORS[vendor];
+  if (!vid) return res.status(400).json({ error: `sin vendor_id para ${vendor}` });
+
+  const horas = Math.min(parseInt(req.query.horas || '48', 10) || 48, 24 * 60);
+  const hasta = new Date();
+  const desde = new Date(hasta.getTime() - horas * 3600 * 1000);
+  const sinZ = d => d.toISOString().slice(0, 19);
+  const conZ = d => d.toISOString();
+  const rango    = `start_time=${encodeURIComponent(sinZ(desde))}&end_time=${encodeURIComponent(sinZ(hasta))}`;
+  const rangoZ   = `start_time=${encodeURIComponent(conZ(desde))}&end_time=${encodeURIComponent(conZ(hasta))}`;
+
+  const candidatas = [
+    ['doc · vendors/{id} con rango',        `/chains/${PEYA_CHAIN}/vendors/${vid}?${rango}`],
+    ['vendors/{id}/orders',                 `/chains/${PEYA_CHAIN}/vendors/${vid}/orders?${rango}`],
+    ['vendors/{id} sin rango',              `/chains/${PEYA_CHAIN}/vendors/${vid}`],
+    ['vendors/{id} con fechas en formato Z',`/chains/${PEYA_CHAIN}/vendors/${vid}?${rangoZ}`],
+    ['orders bajo la cadena',               `/chains/${PEYA_CHAIN}/orders?vendor_id=${vid}&${rango}`],
+    ['orders sueltas',                      `/orders?chain_id=${PEYA_CHAIN}&vendor_id=${vid}&${rango}`],
+    ['catálogo (control: tiene que andar)', `/chains/${PEYA_CHAIN}/vendors/${vid}/catalog`],
+  ];
+
+  const token = await obtenerToken();
+  const salida = { vendor, vendor_id: vid, chain: PEYA_CHAIN, pruebas: [] };
+
+  for (const [nombre, ruta] of candidatas) {
+    try {
+      const r = await fetch(`${PEYA_BASE}${ruta}`, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${token}` },
+        signal: AbortSignal.timeout(20000),
+      });
+      const cuerpo = (await r.text()) || '';
+      salida.pruebas.push({
+        prueba: nombre,
+        ruta,                       // sin dominio ni token: se puede compartir
+        http: r.status,
+        cuerpo_vacio: cuerpo.length === 0,
+        // Recortado y sin datos personales: solo queremos ver la forma
+        // de la respuesta y el mensaje de error si lo hay.
+        asoma: taparPersonales(
+          (() => { try { return JSON.parse(cuerpo); } catch { return cuerpo.slice(0, 300); } })()
+        ),
+      });
+    } catch (e) {
+      salida.pruebas.push({ prueba: nombre, ruta, error: e.message });
+    }
+  }
+
+  // Resumen en una línea, para no tener que leer todo el detalle
+  const buenas = salida.pruebas.filter(p => p.http >= 200 && p.http < 300 && !/catálogo/.test(p.prueba));
+  salida.veredicto = buenas.length
+    ? `La ruta que funciona es: ${buenas.map(p => p.prueba).join(', ')}`
+    : 'Ninguna ruta de pedidos responde. Muy probablemente la API de órdenes no esté habilitada para esta cadena.';
+
+  res.json(salida);
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
 app.get('/health', (_req, res) => res.json({
