@@ -324,11 +324,127 @@ function tocaFull() {
 }
 setInterval(() => sincronizar(tocaFull()), INTERVALO_MIN * 60 * 1000);
 
+const autorizado = req => !ADMIN_TOKEN || req.get('x-admin-token') === ADMIN_TOKEN;
+
+// ═══════════════════════════════════════════════════════════════
+// SONDA DE PEDIDOS  ·  SOLO LECTURA
+//
+// No escribe en la base ni le manda nada a PedidosYa. Su único trabajo
+// es contestar dos preguntas que no se pueden responder leyendo la
+// documentación:
+//
+//   1. ¿La credencial que ya tenemos (la del catálogo) sirve también
+//      para leer pedidos, o hace falta habilitar algo más?
+//
+//   2. ¿Los pedidos aparecen apenas entran, o recién una vez que el
+//      repartidor los levantó? De eso depende si Lucas puede tenerlos
+//      preparados antes de que llegue el repartidor, que es todo el
+//      punto de esto.
+//
+// Usa la MISMA autenticación y el mismo manejo de 401 que el catálogo,
+// así que si el catálogo funciona, acá lo único que puede fallar es el
+// permiso sobre el endpoint de órdenes — que es justo lo que queremos
+// averiguar.
+// ═══════════════════════════════════════════════════════════════
+
+// Los pedidos traen datos personales del cliente (teléfono, dirección,
+// nombre). Nada de eso hace falta para decidir la integración y no
+// tiene por qué salir del servidor: se recorta antes de devolver nada.
+const CAMPOS_PERSONALES = /^(phone|mobile|telephone|email|address|street|customer|client|first_name|last_name|full_name|name_?surname|door|apartment|latitude|longitude|coordinates|notes|comment)$/i;
+
+function taparPersonales(valor, profundidad = 0) {
+  if (valor === null || valor === undefined || profundidad > 6) return valor;
+  if (Array.isArray(valor)) return valor.map(v => taparPersonales(v, profundidad + 1));
+  if (typeof valor !== 'object') return valor;
+  const salida = {};
+  for (const [k, v] of Object.entries(valor)) {
+    if (CAMPOS_PERSONALES.test(k)) {
+      // Se conserva el tipo y si venía con algo, para saber que el campo
+      // existe, pero no su contenido.
+      salida[k] = v === null || v === '' ? v : '«tapado»';
+    } else {
+      salida[k] = taparPersonales(v, profundidad + 1);
+    }
+  }
+  return salida;
+}
+
+async function pedirPedidos(vendor, desde, hasta, pagina = 1, porPagina = 20) {
+  const url = `${PEYA_BASE}/chains/${PEYA_CHAIN}/vendors/${VENDORS[vendor]}`
+    + `?start_time=${encodeURIComponent(desde)}&end_time=${encodeURIComponent(hasta)}`
+    + `&page_size=${porPagina}&page=${pagina}`;
+
+  const traer = async token => {
+    const r = await fetch(url, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(30000),
+    });
+    return { status: r.status, ok: r.ok, cuerpo: await r.text() };
+  };
+
+  let r = await traer(await obtenerToken());
+  // Mismo criterio que el catálogo: un 401 puede ser el token vencido
+  // antes de tiempo. Se pide uno nuevo y se reintenta una sola vez.
+  if (r.status === 401) {
+    TOKEN_CACHE = { valor: null, vence: 0 };
+    r = await traer(await obtenerToken());
+  }
+  return { url, ...r };
+}
+
+// GET /probar-pedidos?horas=24&vendor=bv2
+app.get('/probar-pedidos', async (req, res) => {
+  if (!autorizado(req)) return res.status(401).json({ error: 'no autorizado' });
+  if (!PEYA_CHAIN) return res.status(500).json({ error: 'falta PEYA_CHAIN_ID' });
+
+  const horas = Math.min(parseInt(req.query.horas || '24', 10) || 24, 24 * 60);
+  const hasta = new Date();
+  const desde = new Date(hasta.getTime() - horas * 3600 * 1000);
+  const iso = d => d.toISOString().slice(0, 19); // la API los quiere en UTC, sin la Z
+
+  const vendors = req.query.vendor ? [req.query.vendor] : Object.keys(VENDORS).filter(v => VENDORS[v]);
+  const salida = { ventana: { desde: iso(desde), hasta: iso(hasta), horas }, vendors: {} };
+
+  for (const v of vendors) {
+    if (!VENDORS[v]) { salida.vendors[v] = { error: 'sin vendor_id configurado' }; continue; }
+    try {
+      const r = await pedirPedidos(v, iso(desde), iso(hasta));
+      let cuerpo;
+      try { cuerpo = JSON.parse(r.cuerpo); } catch { cuerpo = r.cuerpo.slice(0, 800); }
+
+      // La respuesta puede venir como array o envuelta en un objeto; se
+      // contemplan las dos formas sin asumir cuál es.
+      const lista = Array.isArray(cuerpo) ? cuerpo
+        : (cuerpo && (cuerpo.orders || cuerpo.data || cuerpo.items || cuerpo.content)) || null;
+
+      salida.vendors[v] = {
+        http: r.status,
+        ok: r.ok,
+        cantidad: Array.isArray(lista) ? lista.length : null,
+        // Lo que más importa: en qué estado vienen. Si acá aparece
+        // RECEIVED, se puede ver el pedido mientras se arma.
+        estados: Array.isArray(lista)
+          ? lista.map(o => o && (o.status || o.order_status || o.state)).filter(Boolean)
+          : null,
+        // Un pedido completo, sin datos personales, para poder mapear
+        // los campos contra la tabla ops.pedidos.
+        muestra: Array.isArray(lista) && lista.length ? taparPersonales(lista[0]) : null,
+        // Si falló, el cuerpo crudo dice por qué (401 = sin permiso sobre
+        // órdenes, 404 = vendor mal, etc.)
+        crudo: r.ok ? undefined : String(r.cuerpo).slice(0, 600),
+      };
+    } catch (e) {
+      salida.vendors[v] = { error: e.message };
+    }
+  }
+
+  res.json(salida);
+});
+
 // ═══════════════════════════════════════════════════════════════
 // ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
-const autorizado = req => !ADMIN_TOKEN || req.get('x-admin-token') === ADMIN_TOKEN;
-
 app.get('/health', (_req, res) => res.json({
   ok: true,
   credenciales: PEYA_CLIENT_ID && PEYA_CLIENT_SECRET ? 'cargadas' : 'faltan',
