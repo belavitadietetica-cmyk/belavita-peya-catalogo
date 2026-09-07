@@ -37,9 +37,21 @@ const PEYA_BASE          = process.env.PEYA_BASE || 'https://pedidosya.partner.d
 const PEYA_CLIENT_ID     = process.env.PEYA_CLIENT_ID;
 const PEYA_CLIENT_SECRET = process.env.PEYA_CLIENT_SECRET;
 const PEYA_CHAIN         = process.env.PEYA_CHAIN_ID;
+// ── LOS LOCALES QUE PUBLICAN ──
+//
+// Chacras cerró el 31/08/2026. El vendor queda declarado porque la tabla y
+// el estado publicado todavía lo nombran, pero se ignora salvo que alguien
+// ponga PEYA_BV3_ACTIVO=1 a propósito.
+//
+// Sin esta guarda alcanzaba con que la variable PEYA_VENDOR_BV3 siguiera
+// cargada en Railway para que el servicio intentara publicar el stock de un
+// local que no existe — y ese stock hoy está en cero, así que habría
+// desactivado productos en una tienda que ni siquiera atiende.
 const VENDORS = {
   bv2: process.env.PEYA_VENDOR_BV2 || null,   // Maipú
-  bv3: process.env.PEYA_VENDOR_BV3 || null,   // Chacras de Coria
+  bv3: process.env.PEYA_BV3_ACTIVO === '1'
+    ? (process.env.PEYA_VENDOR_BV3 || null)
+    : null,                                    // Chacras · cerrado
 };
 
 const INTERVALO_MIN     = parseInt(process.env.INTERVALO_MIN || '12', 10);
@@ -50,11 +62,34 @@ const ENVIAR_MAX_PEDIDO = (process.env.ENVIAR_MAX_POR_PEDIDO || 'on').toLowerCas
 const ADMIN_TOKEN       = process.env.ADMIN_TOKEN || '';
 const TZ_OFFSET_HORAS   = -3;
 
+// ── EL MARKUP ──
+//
+// Se le suma al precio de mostrador para armar el de PedidosYa.
+//
+// ── LA CUENTA COMPLETA, PORQUE EL NÚMERO ENGAÑA ──
+//
+// PedidosYa se lleva el 35%. Y el precio de mostrador ya tiene 50% sobre el
+// costo con IVA, o sea que el costo es 0,667 del precio.
+//
+//   markup 20% → cobrás 1,20 P → te queda 0,780 P → +17% sobre el costo
+//   markup  7% → cobrás 1,07 P → te queda 0,696 P →  +4,4%
+//   markup  5% → cobrás 1,05 P → te queda 0,683 P →  +2,4%
+//   markup 2,6%                                    →     0%  ← equilibrio
+//
+// Con 7% el canal deja poco y es a propósito: la apuesta es reconocimiento
+// y rotación, no margen. Pero que sea una decisión tomada con el número
+// adelante y no una sorpresa cuando el panel muestre el canal en cero.
+//
+// Los cuatro niveles quedan porque la tabla los usa, pero todos en 7%: hoy
+// no hay motivo para cobrar distinto según el origen del producto. Si algún
+// día vuelve a haberlo, se cambia por variable de entorno sin deploy.
+const MARKUP_BASE = parseFloat(process.env.MARKUP_PEYA || '0.07');
+
 const MARKUP = {
-  privada:     parseFloat(process.env.MARKUP_PRIVADA     || '0.15'),
-  condimentos: parseFloat(process.env.MARKUP_CONDIMENTOS || '0.25'),
-  regional:    parseFloat(process.env.MARKUP_REGIONAL    || '0.22'),
-  nacional:    parseFloat(process.env.MARKUP_NACIONAL    || '0.14'),
+  privada:     parseFloat(process.env.MARKUP_PRIVADA     || String(MARKUP_BASE)),
+  condimentos: parseFloat(process.env.MARKUP_CONDIMENTOS || String(MARKUP_BASE)),
+  regional:    parseFloat(process.env.MARKUP_REGIONAL    || String(MARKUP_BASE)),
+  nacional:    parseFloat(process.env.MARKUP_NACIONAL    || String(MARKUP_BASE)),
 };
 
 const sb = createClient(SB_URL, SB_KEY, { db: { schema: 'ops' }, auth: { persistSession: false } });
