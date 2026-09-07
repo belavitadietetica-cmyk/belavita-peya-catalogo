@@ -359,6 +359,110 @@ function tocaFull() {
 }
 setInterval(() => sincronizar(tocaFull()), INTERVALO_MIN * 60 * 1000);
 
+// ═══════════════════════════════════════════════════════════════
+// LA VENTA DEL MOSTRADOR LLEGA EN SEGUNDOS
+//
+// ── EL PROBLEMA ──
+//
+// El ciclo normal corre cada 7 minutos. Con el umbral en 1, un producto con
+// una sola unidad se publica — y si esa unidad se vende en el mostrador,
+// hasta 7 minutos después sigue disponible en PedidosYa. Alguien lo pide,
+// Lucas va a buscarlo y no está.
+//
+// Bajar el ciclo no lo resuelve: por más que corra cada minuto, la ventana
+// existe igual. Lo que la cierra es reaccionar a la venta.
+//
+// ── POR QUÉ EL SERVICIO PREGUNTA EN VEZ DE QUE CYRON AVISE ──
+//
+// Lo directo sería que el POS llame a /sync al cobrar. Dos problemas:
+//
+//   · el token de admin quedaría en el navegador de cada vendedor
+//   · y una llamada de red entraría al camino de una venta. Si PedidosYa
+//     tarda tres segundos, el vendedor espera tres segundos con el cliente
+//     enfrente. Nada que no sea cobrar puede meterse ahí.
+//
+// Así, el POS no sabe que esto existe. El servicio hace una consulta chica
+// cada 20 segundos —solo el id y la fecha de las ventas nuevas— y recién si
+// hubo alguna que toque un producto publicado, sincroniza.
+//
+// ── LO QUE CUESTA ──
+//
+// 4.320 consultas por día que en su mayoría no devuelven nada. Es una
+// lectura por índice sobre created_at: cuesta menos que un ciclo completo.
+// Y a PedidosYa no le llega nada extra: el filtro de deltas ya se encarga
+// de que solo viaje lo que cambió.
+const VENTAS_CADA_SEG = parseInt(process.env.VENTAS_CADA_SEG || '20', 10);
+
+// Desde cuándo mirar. Arranca en "ahora": las ventas de antes de que el
+// servicio levantara ya están reflejadas en el último ciclo completo.
+let ultimaVentaVista = new Date().toISOString();
+let skusPublicados = null;
+let skusPublicadosAt = 0;
+
+// Los producto_id que están publicados en PedidosYa. Se cachean 5 minutos:
+// sin esto, cada chequeo traería 490 filas para descartarlas casi siempre.
+async function productosPublicados() {
+  if (skusPublicados && Date.now() - skusPublicadosAt < 5 * 60 * 1000) return skusPublicados;
+  try {
+    const filas = await traerTodo('peya_catalogo', 'producto_id',
+      q => q.eq('publicado_bv2', true).eq('pausado_manual', false));
+    skusPublicados = new Set(filas.map(f => f.producto_id).filter(Boolean));
+    skusPublicadosAt = Date.now();
+  } catch (e) {
+    log('✗ no se pudo leer qué está publicado:', e.message);
+    // Sin la lista se asume que cualquier venta importa. Sincronizar de más
+    // es barato; no sincronizar cuando hacía falta es un pedido perdido.
+    skusPublicados = null;
+  }
+  return skusPublicados;
+}
+
+async function revisarVentas() {
+  if (corriendo) return;   // ya hay un ciclo andando: la venta entra en ese
+  try {
+    const { data, error } = await sb
+      .from('ventas_pos')
+      .select('id, created_at, items')
+      .eq('sucursal_id', 'bv2')
+      .eq('cancelada', false)
+      .gt('created_at', ultimaVentaVista)
+      .order('created_at', { ascending: true })
+      .limit(50);
+
+    if (error) { log('✗ revisar ventas:', error.message); return; }
+    if (!data || !data.length) return;
+
+    // Se avanza la marca SIEMPRE, aunque después se decida no sincronizar.
+    // Si no, una venta de algo que no está en PedidosYa haría que se
+    // revisara la misma venta cada 20 segundos para siempre.
+    ultimaVentaVista = data[data.length - 1].created_at;
+
+    const publicados = await productosPublicados();
+    let toca = !publicados;   // sin lista, se sincroniza por las dudas
+
+    if (publicados) {
+      for (const v of data) {
+        for (const it of (v.items || [])) {
+          if (publicados.has(Number(it.producto_id))) { toca = true; break; }
+        }
+        if (toca) break;
+      }
+    }
+
+    if (!toca) return;   // se vendió, pero nada que esté en PedidosYa
+
+    log(`· ${data.length} venta(s) en el mostrador — sincronizando`);
+    await sincronizar(false);
+  } catch (e) {
+    // Nunca puede tumbar el servicio: el ciclo normal sigue corriendo.
+    log('✗ revisar ventas:', e.message);
+  }
+}
+
+if (VENTAS_CADA_SEG > 0) {
+  setInterval(revisarVentas, VENTAS_CADA_SEG * 1000);
+}
+
 const autorizado = req => !ADMIN_TOKEN || req.get('x-admin-token') === ADMIN_TOKEN;
 
 // ═══════════════════════════════════════════════════════════════
@@ -638,6 +742,7 @@ app.post('/webhook/catalogo', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`belavita-peya-catalogo v2 · puerto ${PORT} · ciclo ${INTERVALO_MIN} min · precios ${MODO_PRECIOS} · freno ${MAX_CAMBIO_PCT}%`);
+  log(`belavita-peya-catalogo v2 · puerto ${PORT} · ciclo ${INTERVALO_MIN} min · ` +
+      `ventas cada ${VENTAS_CADA_SEG}s · precios ${MODO_PRECIOS} · freno ${MAX_CAMBIO_PCT}%`);
   sincronizar(false);
 });
