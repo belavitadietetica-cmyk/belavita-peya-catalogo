@@ -723,6 +723,86 @@ app.get('/simulacro', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════
+//  AVISO DE VENTA · el POS acaba de vender algo
+//
+//  ── POR QUÉ NO ALCANZA CON EL CICLO ──
+//
+//  El ciclo corre cada pocos minutos. Entre que se vende algo en el
+//  mostrador y que PedidosYa se entera, esa unidad está ofrecida en los dos
+//  lados. Bajar el intervalo achica la ventana; no la cierra.
+//
+//  Con esto, la ventana pasa a ser de segundos: el POS avisa apenas cobra.
+//
+//  ── POR QUÉ UN TOKEN PROPIO Y NO EL DE ADMIN ──
+//
+//  Quien llama a esto es Cyron, desde el NAVEGADOR. Su HTML es público:
+//  cualquiera que abra el sitio y mire el código fuente ve el token.
+//
+//  Con ADMIN_TOKEN ahí adentro, esa persona podría además:
+//
+//    GET /probar-pedidos        · los pedidos con datos de clientes
+//    GET /probar-credenciales   · si las credenciales de PedidosYa andan
+//    GET /probar-rutas          · la estructura de la integración
+//
+//  AVISO_TOKEN sirve para UNA cosa: pedir una sincronización. Quien lo lea
+//  del HTML puede, como mucho, hacer que el catálogo se actualice antes de
+//  tiempo. Molesto y nada más.
+//
+//  Sin AVISO_TOKEN configurada, la ruta acepta el de admin y nada más — así
+//  no queda abierta por olvidar una variable.
+function autorizadoAviso(req) {
+  const t = req.get('x-aviso-token') || req.get('x-admin-token');
+  if (!t) return false;
+  const validos = [process.env.AVISO_TOKEN, ADMIN_TOKEN].filter(Boolean);
+  if (!validos.length) return false;   // sin ninguna configurada, nadie entra
+  return validos.includes(t);
+}
+
+// ── EL FRENO: UNA VENTA DE DIEZ RENGLONES NO SON DIEZ SINCRONIZACIONES ──
+//
+// El POS avisa una vez por venta, pero pueden entrar varias seguidas —dos
+// cajas, un pedido grande— y cada llamada a PedidosYa cuenta contra el
+// límite de la API.
+//
+// Si hace menos de PAUSA_AVISO_SEG que corrió una, no se corre otra: se
+// agenda. Así diez ventas en un minuto terminan en una sola sincronización,
+// y ninguna se pierde.
+const PAUSA_AVISO_SEG = parseInt(process.env.PAUSA_AVISO_SEG || '20', 10);
+let ultimoAviso = 0;
+let avisoAgendado = null;
+
+function pedirSincronizacion() {
+  const ahora = Date.now();
+  const falta = PAUSA_AVISO_SEG * 1000 - (ahora - ultimoAviso);
+
+  if (falta <= 0) {
+    ultimoAviso = ahora;
+    sincronizar(false).catch(e => log('aviso-venta:', e.message));
+    return { modo: 'ahora' };
+  }
+  // Ya hay una agendada: esta venta queda cubierta por esa.
+  if (avisoAgendado) return { modo: 'agendada', en_seg: Math.ceil(falta / 1000) };
+
+  avisoAgendado = setTimeout(() => {
+    avisoAgendado = null;
+    ultimoAviso = Date.now();
+    sincronizar(false).catch(e => log('aviso-venta:', e.message));
+  }, falta);
+  return { modo: 'agendada', en_seg: Math.ceil(falta / 1000) };
+}
+
+// POST /aviso-venta
+//
+// Contesta al toque y sincroniza por detrás. El POS no puede quedarse
+// esperando a PedidosYa para terminar de cobrar: si la API está lenta, la
+// persona que está pagando lo sufre.
+app.post('/aviso-venta', (req, res) => {
+  if (!autorizadoAviso(req)) return res.status(401).json({ error: 'no autorizado' });
+  const r = pedirSincronizacion();
+  res.json({ ok: true, ...r });
+});
+
 // POST /sync?full=1&sin_limite=1
 app.post('/sync', async (req, res) => {
   if (!autorizado(req)) return res.status(401).json({ error: 'no autorizado' });
